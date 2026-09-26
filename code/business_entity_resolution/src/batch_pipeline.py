@@ -373,6 +373,9 @@ def main():
                          "batch is still fully blocked/scored regardless)")
     ap.add_argument("--skip-loco", action="store_true")
     ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--max-s1", type=int, default=None,
+                    help="process only the first N S1 entities - for a quick throughput/"
+                         "sanity check on real data before committing to a full run")
     ap.add_argument("--notes", default="")
     a = ap.parse_args()
     if a.mode == "train":

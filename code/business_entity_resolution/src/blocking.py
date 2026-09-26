@@ -27,13 +27,24 @@ from .representations import rowdot
 FLAGS = ["g_name", "g_joint", "g_dense", "g_key"]
 
 
-def _sparse_topn(Q, D, k, min_sim, q_chunk=200_000):
+def _sparse_topn(Q, D, k, min_sim, q_chunk=200_000, DT=None, n_threads=-1):
     """Q, D: sparse CSR matrices (Q = queries, D = corpus). Returns (row, col,
     score) arrays for each query's up-to-k highest-cosine corpus rows with
     score > min_sim. Batches over Q rows only for progress/latency, not for
     memory - sparse_dot_topn's own memory use is bounded by top_n regardless of
-    corpus size, which is the whole point of using it here."""
-    k = min(k, D.shape[0])
+    corpus size, which is the whole point of using it here.
+
+    n_threads=-1 (use all but one core) matters a lot: sp_matmul_topn defaults
+    to SEQUENTIAL (single-core) processing if n_threads is left as None. That
+    default is exactly what caused single-core-pinned, 20-30-minutes-per-batch
+    behavior on a 64-vCPU instance where 63 cores sat idle - not a memory or
+    algorithmic problem, just an unset threading parameter.
+
+    Pass a precomputed `DT` (= D.T.tocsr()) when this is called repeatedly
+    against the SAME corpus (e.g. once per S1 batch in batch_pipeline.py), to
+    avoid re-transposing a multi-million-row matrix on every call."""
+    n_d = DT.shape[1] if DT is not None else D.shape[0]
+    k = min(k, n_d)
     if k == 0 or Q.shape[0] == 0:
         z = np.empty(0, dtype=np.int64)
         return z, z.copy(), np.empty(0, dtype=np.float32)
@@ -41,12 +52,13 @@ def _sparse_topn(Q, D, k, min_sim, q_chunk=200_000):
         from sparse_dot_topn import sp_matmul_topn
     except ImportError:
         return _sparse_topn_fallback(Q, D, k, min_sim)
-    DT = D.T.tocsr()
+    if DT is None:
+        DT = D.T.tocsr()
     thr = float(min_sim) if min_sim > 0 else None
     rows, cols, vals = [], [], []
     for s in range(0, Q.shape[0], q_chunk):
         C = sp_matmul_topn(Q[s:s + q_chunk].tocsr(), DT, top_n=k,
-                           threshold=thr, sort=False).tocoo()
+                           threshold=thr, sort=False, n_threads=n_threads).tocoo()
         rows.append(C.row.astype(np.int64) + s)
         cols.append(C.col.astype(np.int64))
         vals.append(C.data.astype(np.float32))
@@ -280,6 +292,26 @@ def s1_self_negative_pairs(r, k=8, min_sim=0.15):
     return pseudo_r, pairs
 
 
+def _knn_pairs_cached(Q, cidx, field, k, min_sim, flag):
+    """Batched-pipeline counterpart to _knn_pairs: uses CandidateIndex's
+    precomputed per-source transposed matrices and column-index arrays (built
+    ONCE at index-construction time, see CandidateIndex.__init__) instead of
+    re-slicing and re-transposing the full corpus matrix on every call. This
+    function runs once per S1 BATCH - potentially hundreds of times - so that
+    recomputation was the actual root cause of an "O(corpus) cost per batch"
+    slowdown (each batch redoing multi-million-row sparse transposes)."""
+    parts = []
+    for s in ("S2", "S3"):
+        cols = cidx.src_cols.get(s)
+        if cols is None or len(cols) == 0:
+            continue
+        ii, jj_local, sc = _sparse_topn(Q, None, k, min_sim, DT=cidx.DT[field][s])
+        jj = cols[jj_local]
+        parts.append(pd.DataFrame({"i": ii, "j": jj, flag: 1}))
+    return (pd.concat(parts, ignore_index=True) if parts
+           else pd.DataFrame(columns=["i", "j", flag]))
+
+
 def _key_pairs_batch(s1_heavy, cidx, cfg):
     """Like _key_pairs, but looks up an already-built CandidateIndex's inverted
     index for just this S1 batch, instead of rebuilding an index every call."""
@@ -302,18 +334,18 @@ def generate_candidates_batch(s1_light, s1_heavy, X1, cidx, cfg,
                               force_ids=None):
     """Candidate generation for one S1 batch against a resident CandidateIndex
     (candidate_index.py) - the batched-pipeline counterpart to
-    generate_candidates(). Reuses the same _knn_pairs (and therefore the same
-    memory-safe _sparse_topn) unchanged; only the corpus side differs (a
-    pre-built index instead of a fully materialized Reps object). Dense
-    embedding blocking (g_dense) is not yet supported in the batched path.
+    generate_candidates(). Uses _knn_pairs_cached (precomputed per-source
+    transposes, see CandidateIndex) rather than _knn_pairs directly, since this
+    runs once per S1 batch rather than once per whole dataset. Dense embedding
+    blocking (g_dense) is not yet supported in the batched path.
 
     force_ids: optional {s1_id: set(cand_id)} of pairs (typically ground-truth
     positives) that must survive the max_cands cap regardless of their blocking
     score, so training positives are never silently dropped by blocking."""
     src = cidx.src
     parts = [
-        _knn_pairs(X1["name_core"], cidx.Xc["name_core"], src, cfg.k_name, cfg.min_tfidf_sim, "g_name"),
-        _knn_pairs(X1["joint_txt"], cidx.Xc["joint_txt"], src, cfg.k_joint, cfg.min_tfidf_sim, "g_joint"),
+        _knn_pairs_cached(X1["name_core"], cidx, "name_core", cfg.k_name, cfg.min_tfidf_sim, "g_name"),
+        _knn_pairs_cached(X1["joint_txt"], cidx, "joint_txt", cfg.k_joint, cfg.min_tfidf_sim, "g_joint"),
         _key_pairs_batch(s1_heavy, cidx, cfg),
     ]
     pairs = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["i", "j"])

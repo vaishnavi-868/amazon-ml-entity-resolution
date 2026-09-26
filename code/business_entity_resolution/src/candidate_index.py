@@ -74,6 +74,14 @@ class CandidateIndex:
             log(f"[CandidateIndex]   transformed {min(s + index_chunk, n):,}/{n:,}")
         self.Xc = {c: vstack(m).tocsr() for c, m in chunks.items()}
 
+        log("[CandidateIndex] precomputing per-source transposed matrices (name_core, "
+           "joint_txt) - a ONE-TIME cost so blocking never re-slices/re-transposes "
+           "the full corpus on every S1 batch, which is what made each batch take "
+           "20-30 minutes at ~10M-row scale before this was cached")
+        self.src_cols = {s: np.where(self.src == s)[0] for s in ("S2", "S3")}
+        self.DT = {c: {s: self.Xc[c][self.src_cols[s]].T.tocsr() for s in ("S2", "S3")}
+                  for c in ("name_core", "joint_txt")}
+
         self.name_idf, self.name_idf_default = token_idf(
             [t.split() for t in self.light.name_core.iloc[samp_idx]])
         self.addr_idf, self.addr_idf_default = token_idf(

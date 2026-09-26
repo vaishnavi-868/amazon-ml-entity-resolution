@@ -1,0 +1,16 @@
+# Versions below were used for the CPU smoke test (Python 3.11+). On the real run,
+# install these, then overwrite this file with `pip freeze` output before packaging.
+pandas==3.0.2
+numpy==2.4.4
+scikit-learn==1.8.0
+scipy==1.17.1
+lightgbm==4.7.0
+rapidfuzz==3.14.6
+joblib==1.5.3
+s3fs>=2024.6.0    # only needed if --data-dir points at an s3:// URI
+sparse_dot_topn>=1.1.0  # memory-safe sparse top-k similarity, used by blocking.py and candidate_index.py
+# --- dense blocking (bge-m3, MIT) and optional cross-encoder (xlm-roberta-base, MIT) ---
+# pin to what `pip freeze` reports on your GPU instance:
+torch>=2.3
+transformers>=4.44
+sentence-transformers>=3.0
